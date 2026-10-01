@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>AR Satfinder</title>
+<style>
+  :root {
+    --bg: #000;
+    --panel: rgba(10, 14, 20, 0.72);
+    --text: #f2f5f8;
+    --muted: #9aa7b4;
+    --sat: #ff5c8a;
+    --dest: #ffb340;
+    --belt: #4fd1ff;
+    --sun: #ffe066;
+    --accent: #7cf29c;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none;
+    touch-action: none;
+  }
+  video, canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  video { object-fit: cover; }
+  .panel {
+    position: fixed; left: 8px; right: 8px;
+    background: var(--panel);
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+    border-radius: 12px; padding: 8px 12px;
+  }
+  #hud-top { top: calc(env(safe-area-inset-top) + 8px); text-align: center; }
+  #aim { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #guide { font-size: 15px; color: var(--sat); font-variant-numeric: tabular-nums; min-height: 1.35em; }
+  #status { font-size: 11.5px; color: var(--muted); }
+  #status .warn { color: var(--dest); }
+  #panel { bottom: calc(env(safe-area-inset-bottom) + 8px); font-size: 13px; }
+  #panel b { font-variant-numeric: tabular-nums; }
+  .sat { color: var(--sat); } .dest { color: var(--dest); } .muted { color: var(--muted); }
+  .row { display: flex; gap: 6px; margin-top: 8px; }
+  .spacer { flex: 1; }
+  #fovDown, #fovUp { min-width: 40px; }
+  button {
+    font: inherit; color: var(--text); background: rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.18); border-radius: 8px;
+    padding: 7px 10px; min-height: 36px;
+  }
+  button:active { background: rgba(255,255,255,0.25); }
+  button:disabled { opacity: 0.4; }
+  #fovLabel { min-width: 62px; text-align: center; align-self: center; font-variant-numeric: tabular-nums; }
+  #start {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #05080c; padding: 24px; z-index: 10;
+  }
+  #start > div { max-width: 420px; }
+  #start h1 { font-size: 26px; margin: 0 0 8px; }
+  #start p { color: var(--muted); margin: 8px 0; }
+  #startBtn {
+    margin-top: 16px; width: 100%; font-size: 17px; padding: 14px;
+    background: var(--accent); color: #04140a; border: 0; font-weight: 600;
+  }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="overlay"></canvas>
+
+<div id="hud-top" class="panel">
+  <div id="aim">Az —° · El —°</div>
+  <div id="guide"></div>
+  <div id="status"></div>
+</div>
+
+<div id="panel" class="panel">
+  <div><span class="sat">● Elektro-L3</span> <span id="satNow" class="muted">loading orbit…</span></div>
+  <div id="satLook"></div>
+  <div><span class="dest">◌ 14.5°W slot</span> <span id="destLook"></span></div>
+  <div id="eta" class="muted"></div>
+  <div class="row">
+    <button id="calBtn" title="Centre the Sun in the crosshair, then tap">☀ Calibrate</button>
+    <button id="calReset" title="Clear Sun calibration">Reset</button>
+    <span class="spacer"></span>
+    <button id="fovDown" title="Narrower field of view" aria-label="Decrease field of view">−</button>
+    <span id="fovLabel"></span>
+    <button id="fovUp" title="Wider field of view" aria-label="Increase field of view">+</button>
+  </div>
+</div>
+
+<div id="start">
+  <div>
+    <h1>AR Satfinder</h1>
+    <p>Hold your phone upright and point the camera at the sky. The overlay shows where <span class="sat">Elektro-L3</span> is now, where it’s heading (<span class="dest">14.5°W</span>), and the arc of geostationary satellites.</p>
+    <p>Phone compasses are typically off by 5–15°. For better accuracy, point the crosshair at the Sun and tap <i>Calibrate on Sun</i>. Don’t look at the Sun directly.</p>
+    <p>Needs camera, location and motion-sensor permission.</p>
+    <button id="startBtn">Start</button>
+  </div>
+</div>
+
+<script type="module">
+import * as sat from 'https://cdn.jsdelivr.net/npm/satellite.js@7.1.0/+esm';
+
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+const AU_KM = 149597870.7;
+const GEO_ALT_KM = 35786;
+const NORAD = 44903;
+const DEST_LON = -14.5;
+// Last known orbit (CelesTrak, 2026-10-01), used when offline or if the fetch fails.
+const FALLBACK_OMM = {"OBJECT_NAME":"ELEKTRO-L 3","OBJECT_ID":"2019-095A","EPOCH":"2026-09-30T23:20:59.822304","MEAN_MOTION":0.99414683,"ECCENTRICITY":0.00029141,"INCLINATION":0.1034,"RA_OF_ASC_NODE":69.4832,"ARG_OF_PERICENTER":94.7115,"MEAN_ANOMALY":215.5021,"EPHEMERIS_TYPE":0,"CLASSIFICATION_TYPE":"U","NORAD_CAT_ID":44903,"ELEMENT_SET_NO":999,"REV_AT_EPOCH":2476,"BSTAR":0,"MEAN_MOTION_DOT":-1.1e-7,"MEAN_MOTION_DDOT":0};
+const OMM_MAX_AGE_MS = 6 * 3600e3; // CelesTrak asks clients not to re-fetch more often than this
+
+const $ = id => document.getElementById(id);
+
+function load(key, dflt) {
+  try { const v = localStorage.getItem(key); return v == null ? dflt : JSON.parse(v); } catch { return dflt; }
+}
+function save(key, v) {
+  try { localStorage.setItem(key, JSON.stringify(v)); } catch {}
+}
+
+const state = {
+  obs: null,            // { lat, lon, heightKm, acc }
+  R: null,              // device -> earth (East, North, Up) rotation, from sensors
+  Rs: null,             // smoothed copy used for rendering
+  source: null,         // 'absolute' | 'ios' | 'relative' | 'drag'
+  iosOff: null,         // smoothed { c, s } of compass-vs-gyro yaw offset (iOS)
+  compassAcc: null,
+  decl: 0, declKnown: false,
+  cal: load('satfinder.cal', 0),
+  fov: load('satfinder.fov', 67),   // horizontal FOV across the camera frame's long side
+  satrec: null, omm: null, ommFetched: null,
+  drag: { yaw: 160, pitch: 25 },
+  sky: null,
+};
+
+// ---------- vector / rotation helpers ----------
+const wrap180 = a => ((a + 180) % 360 + 360) % 360 - 180;
+const wrap360 = a => (a % 360 + 360) % 360;
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const norm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const mul = (M, v) => [dot(M[0], v), dot(M[1], v), dot(M[2], v)];
+const mulT = (M, v) => [
+  M[0][0]*v[0] + M[1][0]*v[1] + M[2][0]*v[2],
+  M[0][1]*v[0] + M[1][1]*v[1] + M[2][1]*v[2],
+  M[0][2]*v[0] + M[1][2]*v[1] + M[2][2]*v[2],
+];
+const azElToEnu = (az, el) => [Math.cos(el*D2R)*Math.sin(az*D2R), Math.cos(el*D2R)*Math.cos(az*D2R), Math.sin(el*D2R)];
+const enuToAzEl = v => ({ az: wrap360(Math.atan2(v[0], v[1]) * R2D), el: Math.asin(Math.max(-1, Math.min(1, v[2]))) * R2D });
+
+// W3C DeviceOrientation: R = Rz(alpha) * Rx(beta) * Ry(gamma); earth frame x=East, y=North, z=Up.
+function eulerToMatrix(alpha, beta, gamma) {
+  const ca = Math.cos(alpha*D2R), sa = Math.sin(alpha*D2R);
+  const cb = Math.cos(beta*D2R),  sb = Math.sin(beta*D2R);
+  const cg = Math.cos(gamma*D2R), sg = Math.sin(gamma*D2R);
+  return [
+    [ca*cg - sa*sb*sg, -cb*sa, ca*sg + cg*sa*sb],
+    [cg*sa + ca*sb*sg,  ca*cb, sa*sg - ca*cg*sb],
+    [-cb*sg,            sb,    cb*cg],
+  ];
+}
+// Rotate about Up so that every azimuth increases by deg.
+function yawRotate(M, deg) {
+  const c = Math.cos(-deg*D2R), s = Math.sin(-deg*D2R);
+  return [
+    [c*M[0][0] - s*M[1][0], c*M[0][1] - s*M[1][1], c*M[0][2] - s*M[1][2]],
+    [s*M[0][0] + c*M[1][0], s*M[0][1] + c*M[1][1], s*M[0][2] + c*M[1][2]],
+    M[2].slice(),
+  ];
+}
+function orthonormalize(M) {
+  const z = norm([M[0][2], M[1][2], M[2][2]]);
+  let x = [M[0][0], M[1][0], M[2][0]];
+  const k = dot(x, z);
+  x = norm([x[0]-k*z[0], x[1]-k*z[1], x[2]-k*z[2]]);
+  const y = cross(z, x);
+  return [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]];
+}
+
+// ---------- sensors ----------
+function onAbsoluteOrientation(e) {
+  if (e.alpha == null) return;
+  state.source = 'absolute';
+  state.R = eulerToMatrix(e.alpha, e.beta, e.gamma);
+}
+
+function onOrientation(e) {
+  if (e.alpha == null || state.source === 'absolute' || state.source === 'drag') return;
+  const R = eulerToMatrix(e.alpha, e.beta, e.gamma);
+  const heading = e.webkitCompassHeading;
+  if (typeof heading === 'number' && heading >= 0) {
+    // iOS: alpha is gyro-relative, webkitCompassHeading is tilt-compensated magnetic heading.
+    // Learn the yaw offset between them while the camera is near the horizon (where the
+    // heading's reference direction is unambiguous), and hold it when pointing steeply.
+    const back = mul(R, [0, 0, -1]);
+    let ref = null;
+    if (Math.abs(back[2]) < 0.8) ref = back;
+    else if (!state.iosOff) ref = mul(R, [0, 1, 0]);
+    if (ref) {
+      const off = (heading - Math.atan2(ref[0], ref[1]) * R2D) * D2R;
+      const c = Math.cos(off), s = Math.sin(off);
+      if (!state.iosOff) state.iosOff = { c, s };
+      else { state.iosOff.c += (c - state.iosOff.c) * 0.08; state.iosOff.s += (s - state.iosOff.s) * 0.08; }
+    }
+    state.compassAcc = e.webkitCompassAccuracy;
+    state.source = 'ios';
+  } else {
+    state.source = e.absolute ? 'absolute' : 'relative';
+  }
+  state.R = R;
+}
+
+function yawOffsetDeg() {
+  switch (state.source) {
+    case 'drag': return 0;
+    case 'ios': return (state.iosOff ? Math.atan2(state.iosOff.s, state.iosOff.c) * R2D : 0) + state.decl + state.cal;
+    default: return state.decl + state.cal;
+  }
+}
+
+function screenAngle() {
+  const a = screen.orientation?.angle ?? window.orientation ?? 0;
+  return wrap360(a);
+}
+
+function enableDrag() {
+  state.source = 'drag';
+  let last = null;
+  const cv = $('overlay');
+  cv.addEventListener('pointerdown', e => { last = [e.clientX, e.clientY]; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointerup', () => { last = null; });
+  cv.addEventListener('pointermove', e => {
+    if (!last) return;
+    const degPerPx = state.fov / Math.max(innerWidth, innerHeight);
+    state.drag.yaw = wrap360(state.drag.yaw - (e.clientX - last[0]) * degPerPx);
+    state.drag.pitch = Math.max(-89, Math.min(89, state.drag.pitch + (e.clientY - last[1]) * degPerPx));
+    last = [e.clientX, e.clientY];
+  });
+}
+
+// ---------- location & magnetic declination ----------
+function setObserver(lat, lon, heightKm, acc) {
+  const first = !state.obs;
+  state.obs = { lat, lon, heightKm, acc };
+  if (first) loadDeclination();
+}
+
+async function loadDeclination() {
+  try {
+    const m = await import('https://cdn.jsdelivr.net/npm/geomagnetism@0.2.0/+esm');
+    const geomag = m.default ?? m;
+    state.decl = geomag.model(new Date()).point([state.obs.lat, state.obs.lon]).decl;
+    state.declKnown = true;
+  } catch (err) {
+    console.warn('Declination model unavailable', err);
+  }
+}
+
+function startLocation() {
+  const p = new URLSearchParams(location.search);
+  if (p.has('lat') && p.has('lon')) {
+    setObserver(+p.get('lat'), +p.get('lon'), 0, null);
+    return;
+  }
+  if (!navigator.geolocation) return;
+  navigator.geolocation.watchPosition(
+    pos => setObserver(pos.coords.latitude, pos.coords.longitude, (pos.coords.altitude || 0) / 1000, pos.coords.accuracy),
+    err => { state.geoErr = err.message || 'Location unavailable'; },
+    { enableHighAccuracy: true, maximumAge: 30000, timeout: 30000 },
+  );
+}
+
+// ---------- orbit data ----------
+function useOmm(omm, fetched) {
+  state.omm = omm;
+  state.ommFetched = fetched;
+  state.satrec = sat.json2satrec(omm);
+}
+
+async function loadOrbit() {
+  const cached = load('satfinder.omm', null);
+  if (cached) useOmm(cached.omm, cached.fetched);
+  else useOmm(FALLBACK_OMM, null);
+  if (cached && Date.now() - cached.fetched < OMM_MAX_AGE_MS) return;
+  try {
+    const r = await fetch(`https://celestrak.org/NORAD/elements/gp.php?CATNR=${NORAD}&FORMAT=json`);
+    const data = await r.json();
+    if (Array.isArray(data) && data[0]?.NORAD_CAT_ID === NORAD) {
+      const fetched = Date.now();
+      save('satfinder.omm', { omm: data[0], fetched });
+      useOmm(data[0], fetched);
+    }
+  } catch (err) {
+    console.warn('CelesTrak fetch failed, using cached orbit', err);
+  }
+}
+
+// ---------- sky model ----------
+function lookAt(ecf, obsGd) {
+  const la = sat.ecfToLookAngles(obsGd, ecf);
+  return { az: wrap360(la.azimuth * R2D), el: la.elevation * R2D };
+}
+function geoEcf(lonDeg) {
+  return sat.geodeticToEcf({ latitude: 0, longitude: lonDeg * D2R, height: GEO_ALT_KM });
+}
+function satAt(date, obsGd) {
+  const pv = sat.propagate(state.satrec, date);
+  if (!pv || !pv.position) return null;
+  const gmst = sat.gstime(date);
+  const geo = sat.eciToGeodetic(pv.position, gmst);
+  return { ...lookAt(sat.eciToEcf(pv.position, gmst), obsGd), lon: wrap180(geo.longitude * R2D) };
+}
+
+function updateSky() {
+  if (!state.obs || !state.satrec) return;
+  const now = new Date();
+  const o = state.obs;
+  const obsGd = { latitude: o.lat * D2R, longitude: o.lon * D2R, height: o.heightKm };
+
+  const cur = satAt(now, obsGd);
+  const tomorrow = satAt(new Date(now.getTime() + 86400e3), obsGd);
+  const drift = cur && tomorrow ? wrap180(tomorrow.lon - cur.lon) : 0;
+
+  // Daily positions along the drift, up to the destination slot (assumes the current drift rate holds).
+  const path = [];
+  if (cur && Math.abs(drift) > 0.05) {
+    let prev = wrap180(cur.lon - DEST_LON);
+    for (let d = 1; d <= 30; d++) {
+      const t = new Date(now.getTime() + d * 86400e3);
+      const p = satAt(t, obsGd);
+      if (!p) break;
+      const rel = wrap180(p.lon - DEST_LON);
+      if (Math.sign(rel) !== Math.sign(prev) && Math.abs(rel - prev) < 90) break;
+      prev = rel;
+      path.push({ ...p, date: t });
+    }
+  }
+
+  const belt = [];
+  for (let L = -90; L <= 90; L += 1) {
+    const lon = wrap180(o.lon + L);
+    belt.push({ ...lookAt(geoEcf(lon), obsGd), lon });
+  }
+
+  const jd = sat.jday(now);
+  const { rsun } = sat.sunPos(jd);
+  const sun = lookAt(sat.eciToEcf({ x: rsun.x * AU_KM, y: rsun.y * AU_KM, z: rsun.z * AU_KM }, sat.gstime(now)), obsGd);
+
+  state.sky = { cur, drift, path, belt, dest: lookAt(geoEcf(DEST_LON), obsGd), sun };
+}
+
+// ---------- rendering ----------
+const cv = $('overlay'), ctx = cv.getContext('2d');
+const video = $('cam');
+let W = 0, H = 0, dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+}
+addEventListener('resize', resize);
+resize();
+
+function focalPx() {
+  const t = Math.tan(state.fov / 2 * D2R);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return (Math.max(W, H) / 2) / t;
+  // Video is drawn with object-fit: cover, so scale the camera's focal length by the cover factor.
+  return (Math.max(vw, vh) / 2) / t * Math.max(W / vw, H / vh);
+}
+
+function cameraBasis() {
+  if (state.source === 'drag') {
+    return eulerToMatrix(-state.drag.yaw, 90 + state.drag.pitch, 0);
+  }
+  if (!state.R) return null;
+  if (!state.Rs) state.Rs = state.R.map(r => r.slice());
+  else for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) state.Rs[i][j] += (state.R[i][j] - state.Rs[i][j]) * 0.3;
+  state.Rs = orthonormalize(state.Rs);
+  return yawRotate(state.Rs, yawOffsetDeg());
+}
+
+function makeProjector(R) {
+  const th = screenAngle() * D2R;
+  const right = [Math.cos(th), -Math.sin(th), 0];
+  const up = [Math.sin(th), Math.cos(th), 0];
+  const f = focalPx(), cx = W / 2, cy = H / 2;
+  return (az, el) => {
+    const v = mulT(R, azElToEnu(az, el));
+    const zc = -v[2], xc = dot(v, right), yc = dot(v, up);
+    const front = zc > 0.02;
+    const x = cx + f * xc / zc, y = cy - f * yc / zc;
+    return { x, y, xc, yc, front, on: front && x >= 0 && x <= W && y >= 0 && y <= H };
+  };
+}
+
+function polyline(project, pts, style, width, dash = []) {
+  ctx.strokeStyle = style; ctx.lineWidth = width; ctx.setLineDash(dash);
+  ctx.beginPath();
+  let pen = false;
+  for (const [az, el] of pts) {
+    const p = project(az, el);
+    if (!p.front || Math.abs(p.x) > 1e4 || Math.abs(p.y) > 1e4) { pen = false; continue; }
+    if (pen) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y);
+    pen = true;
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function label(text, x, y, color, align = 'left') {
+  ctx.font = '600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+
+function edgeArrow(p, color, text) {
+  // Point towards an off-screen target from the screen edge.
+  let dx = p.xc, dy = -p.yc;
+  if (!p.front && Math.hypot(dx, dy) < 1e-3) dy = 1;
+  const a = Math.atan2(dy, dx);
+  const m = 46, cx = W / 2, cy = H / 2;
+  const sx = Math.abs(Math.cos(a)) > 1e-6 ? (cx - m) / Math.abs(Math.cos(a)) : Infinity;
+  const sy = Math.abs(Math.sin(a)) > 1e-6 ? (cy - m) / Math.abs(Math.sin(a)) : Infinity;
+  const r = Math.min(sx, sy);
+  const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(a);
+  ctx.fillStyle = color; ctx.strokeStyle = 'rgba(0,0,0,0.7)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(18, 0); ctx.lineTo(-10, -12); ctx.lineTo(-4, 0); ctx.lineTo(-10, 12); ctx.closePath();
+  ctx.stroke(); ctx.fill();
+  ctx.restore();
+  const lx = x - Math.cos(a) * 30, ly = y - Math.sin(a) * 30;
+  label(text, lx, ly, color, Math.cos(a) > 0.3 ? 'right' : Math.cos(a) < -0.3 ? 'left' : 'center');
+}
+
+const fmtLon = lon => `${Math.abs(lon).toFixed(1)}°${lon < 0 ? 'W' : 'E'}`;
+const fmtBeltLon = n => n === 0 ? '0°' : `${Math.abs(n)}°${n < 0 ? 'W' : 'E'}`;
+const fmtDate = d => d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const R = cameraBasis();
+  const sky = state.sky;
+  if (!R) { requestAnimationFrame(draw); return; }
+  const project = makeProjector(R);
+
+  // Elevation rings and azimuth spokes.
+  for (let el = 0; el <= 80; el += 10) {
+    const pts = []; for (let az = 0; az <= 360; az += 2) pts.push([az, el]);
+    polyline(project, pts, el === 0 ? 'rgba(255,255,255,0.65)' : 'rgba(255,255,255,0.18)', el === 0 ? 2 : 1);
+  }
+  for (let az = 0; az < 360; az += 30) {
+    const pts = []; for (let el = 0; el <= 80; el += 2) pts.push([az, el]);
+    polyline(project, pts, 'rgba(255,255,255,0.18)', 1);
+    const p = project(az, 0);
+    if (p.on) label(({ 0: 'N', 90: 'E', 180: 'S', 270: 'W' })[az] ?? `${az}°`, p.x, p.y + 12, '#fff', 'center');
+  }
+  for (let el = 10; el <= 80; el += 10) {
+    for (const az of [0, 90, 180, 270]) {
+      const p = project(az, el);
+      if (p.on) label(`${el}°`, p.x + 4, p.y - 8, 'rgba(255,255,255,0.6)');
+    }
+  }
+
+  if (sky) {
+    // Geostationary belt.
+    polyline(project, sky.belt.filter(b => b.el > -15).map(b => [b.az, b.el]), 'rgba(79,209,255,0.75)', 2, [8, 6]);
+    for (const b of sky.belt) {
+      if (Math.round(b.lon) % 10 !== 0 || b.el < -5) continue;
+      const p = project(b.az, b.el);
+      if (!p.on) continue;
+      ctx.fillStyle = 'rgba(79,209,255,0.9)'; ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+      label(fmtBeltLon(Math.round(b.lon)), p.x, p.y + 14, 'rgba(79,209,255,0.95)', 'center');
+    }
+
+    // Sun.
+    const ps = project(sky.sun.az, sky.sun.el);
+    if (ps.on) {
+      ctx.fillStyle = 'rgba(255,224,102,0.35)'; ctx.strokeStyle = '#ffe066'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(ps.x, ps.y, 14, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      label('Sun', ps.x + 20, ps.y, '#ffe066');
+    }
+
+    // Predicted drift path; only label dots that have room.
+    let lastLabelX = -Infinity;
+    for (const d of sky.path) {
+      const p = project(d.az, d.el);
+      if (!p.on) continue;
+      ctx.fillStyle = '#ff5c8a'; ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill();
+      if (Math.abs(p.x - lastLabelX) > 56) {
+        label(fmtDate(d.date), p.x, p.y - 12, 'rgba(255,92,138,0.9)', 'center');
+        lastLabelX = p.x;
+      }
+    }
+
+    // Destination slot.
+    const pd = project(sky.dest.az, sky.dest.el);
+    if (pd.on) {
+      ctx.strokeStyle = '#ffb340'; ctx.lineWidth = 2.5; ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.arc(pd.x, pd.y, 18, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+      label('14.5°W slot', pd.x + 24, pd.y, '#ffb340');
+    }
+
+    // Elektro-L3 now.
+    if (sky.cur) {
+      const p = project(sky.cur.az, sky.cur.el);
+      if (p.on) {
+        ctx.strokeStyle = '#ff5c8a'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 20, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(p.x - 30, p.y); ctx.lineTo(p.x - 22, p.y); ctx.moveTo(p.x + 22, p.y); ctx.lineTo(p.x + 30, p.y);
+        ctx.moveTo(p.x, p.y - 30); ctx.lineTo(p.x, p.y - 22); ctx.moveTo(p.x, p.y + 22); ctx.lineTo(p.x, p.y + 30);
+        ctx.stroke();
+        label('Elektro-L3', p.x + 34, p.y - 8, '#ff5c8a');
+        label(`${sky.cur.az.toFixed(1)}° / ${sky.cur.el.toFixed(1)}°`, p.x + 34, p.y + 9, '#ff5c8a');
+      } else {
+        edgeArrow(p, '#ff5c8a', 'Elektro-L3');
+      }
+    }
+  }
+
+  // Crosshair.
+  const cx = W / 2, cy = H / 2;
+  ctx.strokeStyle = 'rgba(124,242,156,0.95)'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - 16, cy); ctx.lineTo(cx - 5, cy); ctx.moveTo(cx + 5, cy); ctx.lineTo(cx + 16, cy);
+  ctx.moveTo(cx, cy - 16); ctx.lineTo(cx, cy - 5); ctx.moveTo(cx, cy + 5); ctx.lineTo(cx, cy + 16);
+  ctx.stroke();
+
+  updateHud(R);
+  requestAnimationFrame(draw);
+}
+
+let hudTick = 0;
+function updateHud(R) {
+  if (performance.now() - hudTick < 120) return;
+  hudTick = performance.now();
+  const aim = enuToAzEl(mul(R, [0, 0, -1]));
+  $('aim').textContent = `Az ${aim.az.toFixed(1)}° · El ${aim.el.toFixed(1)}°`;
+
+  const sky = state.sky;
+  if (sky?.cur) {
+    const dAz = wrap180(sky.cur.az - aim.az), dEl = sky.cur.el - aim.el;
+    const h = Math.abs(dAz) < 0.5 ? '' : `${dAz > 0 ? '→' : '←'} ${Math.abs(dAz).toFixed(1)}° ${dAz > 0 ? 'right' : 'left'}`;
+    const v = Math.abs(dEl) < 0.5 ? '' : `${dEl > 0 ? '↑' : '↓'} ${Math.abs(dEl).toFixed(1)}° ${dEl > 0 ? 'up' : 'down'}`;
+    $('guide').textContent = h || v ? `Elektro-L3: ${[h, v].filter(Boolean).join(', ')}` : 'On target: Elektro-L3';
+  }
+
+  const s = [];
+  if (state.geoErr && !state.obs) s.push(`<span class="warn">Location: ${state.geoErr}</span>`);
+  else if (!state.obs) s.push('Waiting for location…');
+  else s.push(`${state.obs.lat.toFixed(4)}, ${state.obs.lon.toFixed(4)}${state.obs.acc ? ` ±${Math.round(state.obs.acc)} m` : ''}`);
+  const src = {
+    absolute: 'compass',
+    ios: `compass${state.compassAcc > 0 ? ` ±${Math.round(state.compassAcc)}°` : ''}`,
+    relative: '<span class="warn">no compass, azimuth unreliable</span>',
+    drag: 'no motion sensors, drag to look',
+  }[state.source] ?? 'waiting for motion sensors…';
+  s.push(src);
+  if (state.source !== 'drag') {
+    s.push(state.declKnown ? `decl ${state.decl >= 0 ? '+' : ''}${state.decl.toFixed(1)}°` : 'decl n/a');
+    if (state.cal) s.push(`cal ${state.cal >= 0 ? '+' : ''}${state.cal.toFixed(1)}°`);
+  }
+  $('status').innerHTML = s.join(' · ');
+
+  if (sky?.cur) {
+    const dir = sky.drift < 0 ? 'W' : 'E';
+    $('satNow').textContent = `at ${fmtLon(sky.cur.lon)}` + (Math.abs(sky.drift) > 0.05 ? `, drifting ${Math.abs(sky.drift).toFixed(2)}°/day ${dir}` : ', on station');
+    $('satLook').innerHTML = `Look: Az <b>${sky.cur.az.toFixed(1)}°</b> · El <b>${sky.cur.el.toFixed(1)}°</b>` + (sky.cur.el < 0 ? ' <span class="dest">(below horizon)</span>' : '');
+    $('destLook').innerHTML = `Az <b>${sky.dest.az.toFixed(1)}°</b> · El <b>${sky.dest.el.toFixed(1)}°</b>`;
+    const remaining = wrap180(DEST_LON - sky.cur.lon);
+    let eta = '';
+    if (Math.abs(remaining) < 0.3) eta = 'Elektro-L3 is at the 14.5°W slot. ';
+    else if (Math.abs(sky.drift) > 0.05 && Math.sign(remaining) === Math.sign(sky.drift)) {
+      const days = remaining / sky.drift;
+      eta = `At this drift rate, reaches 14.5°W around ${fmtDate(new Date(Date.now() + days * 86400e3))} (operators usually slow the drift near the end). `;
+    }
+    const epoch = new Date(state.omm.EPOCH + 'Z');
+    const ageH = (Date.now() - epoch) / 3600e3;
+    $('eta').textContent = `${eta}Orbit epoch ${epoch.toISOString().slice(0, 16).replace('T', ' ')} UTC (${ageH < 48 ? `${ageH.toFixed(0)} h` : `${(ageH / 24).toFixed(0)} days`} old).`;
+  }
+
+  $('calBtn').disabled = !sky || sky.sun.el < 2 || state.source === 'drag' || !state.source;
+  $('fovLabel').textContent = `FOV ${state.fov.toFixed(0)}°`;
+}
+
+// ---------- controls ----------
+$('calBtn').addEventListener('click', () => {
+  const R = cameraBasis();
+  if (!R || !state.sky) return;
+  const aim = enuToAzEl(mul(R, [0, 0, -1]));
+  state.cal = wrap180(state.cal + wrap180(state.sky.sun.az - aim.az));
+  save('satfinder.cal', state.cal);
+});
+$('calReset').addEventListener('click', () => { state.cal = 0; save('satfinder.cal', 0); });
+$('fovDown').addEventListener('click', () => { state.fov = Math.max(20, state.fov - 1); save('satfinder.fov', state.fov); });
+$('fovUp').addEventListener('click', () => { state.fov = Math.min(120, state.fov + 1); save('satfinder.fov', state.fov); });
+
+$('startBtn').addEventListener('click', async () => {
+  const errs = [];
+  // iOS requires the motion permission request to happen directly inside the tap handler.
+  const motionPerm = typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'
+    ? DeviceOrientationEvent.requestPermission().catch(e => 'denied')
+    : Promise.resolve('granted');
+  const camPerm = navigator.mediaDevices?.getUserMedia
+    ? navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
+        .then(stream => { video.srcObject = stream; return video.play().catch(() => {}); })
+        .catch(e => errs.push(`Camera: ${e.message || e.name}`))
+    : Promise.resolve(errs.push(window.isSecureContext ? 'Camera not supported' : 'Camera needs HTTPS'));
+
+  startLocation();
+  loadOrbit();
+
+  const motion = await motionPerm;
+  if (motion === 'granted') {
+    addEventListener('deviceorientationabsolute', onAbsoluteOrientation);
+    addEventListener('deviceorientation', onOrientation);
+  } else {
+    errs.push('Motion sensor permission denied');
+  }
+  $('start').style.display = 'none';
+  setTimeout(() => { if (!state.R) enableDrag(); }, 2000);
+  await camPerm;
+  if (errs.length) alert(errs.join('\n'));
+});
+
+setInterval(updateSky, 500);
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
